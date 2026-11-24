@@ -1,6 +1,6 @@
 -- BURIN : ตั้งค่าฐานข้อมูล Supabase
 -- วางทั้งไฟล์นี้ใน SQL Editor ของโปรเจกต์ แล้วกด Run รันซ้ำได้ไม่เสียหาย และไม่ลบข้อมูลที่มีอยู่
--- ไฟล์นี้ประกอบจาก 001_base.sql, 002_central.sql, 003_marks.sql ด้วย tools/sql_build.py ห้ามแก้ไฟล์นี้โดยตรง
+-- ไฟล์นี้ประกอบจาก 001_base.sql, 002_central.sql, 003_marks.sql, 004_show.sql ด้วย tools/sql_build.py ห้ามแก้ไฟล์นี้โดยตรง
 -- ทุกส่วนรันในคราวเดียว ถ้าส่วนใดไม่สำเร็จ ฐานข้อมูลจะกลับเป็นเหมือนก่อนรัน
 
 begin;
@@ -602,5 +602,81 @@ returns boolean language sql stable security definer set search_path = public as
         or now() <= nullif(a.data->'ext'->>'all', '')::timestamptz
         or (p_data->'stu' ? 'sid' and now() <= nullif(a.data->'ext'->'stu'->>left(encode(sha256(convert_to(coalesce(a.data->>'clsId', '') || '|id|' || lower(p_data->'stu'->>'sid'), 'UTF8')), 'hex'), 18), '')::timestamptz)))));
 $$;
+
+-- ======== 004_show.sql ========
+
+-- 004_show.sql: homework the teacher set to show later stays closed in the database too (owner chose 24 Nov 2026, task 1.5)
+-- Builds on 002_central.sql (hw_get and hw_class without the teacher's account id) and 003_marks.sql (hw_submit_ok).
+-- Safe to run again; changes functions only, no table and no row.
+--
+-- The app (switch hwshow) keeps data.show on an assignment: a time (ISO) or 'end' (after the teacher closes the live room,
+-- when the app writes the time it closed). Until then the app hides the work, but the database still handed it out whole
+-- and took hand-ins. Now, for anyone but the teacher who owns it, until data.show has passed:
+--   hw_get and hw_class give the row with only data.show, data.clsId and data.kind (title, due and open stay), so the app
+--   still says when it opens and can ask again then, and the questions are not out early;
+--   hw_submit_ok and hw_accepts_any refuse, so no hand-in and no file is taken before it opens.
+-- data.show that is missing, empty or not a time means shown, as before (old assignments are not affected).
+
+create or replace function public.hw_shown(p_data jsonb, p_owner uuid) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare v text := coalesce(p_data->>'show', '');
+begin
+  if p_owner is not null and p_owner = auth.uid() then return true; end if;
+  if v = '' then return true; end if;
+  if v = 'end' then return false; end if;
+  begin
+    return v::timestamptz <= now();
+  exception when others then
+    return true;
+  end;
+end $$;
+
+-- the row a learner may see: whole when shown, otherwise only when it opens
+create or replace function public.hw_get(p_id text)
+returns setof public.assignments language sql stable security definer set search_path = public as $$
+  select (jsonb_populate_record(null::public.assignments,
+    case when public.hw_shown(a.data, a.owner) then to_jsonb(a) - 'owner'
+    else (to_jsonb(a) - 'owner') || jsonb_build_object('data', jsonb_strip_nulls(jsonb_build_object(
+      'show', a.data->'show', 'clsId', a.data->'clsId', 'kind', a.data->'kind'))) end)).*
+  from public.assignments a where a.id = p_id;
+$$;
+create or replace function public.hw_class(p_cls text)
+returns setof public.assignments language sql stable security definer set search_path = public as $$
+  select (jsonb_populate_record(null::public.assignments,
+    case when public.hw_shown(a.data, a.owner) then to_jsonb(a) - 'owner'
+    else (to_jsonb(a) - 'owner') || jsonb_build_object('data', jsonb_strip_nulls(jsonb_build_object(
+      'show', a.data->'show', 'clsId', a.data->'clsId', 'kind', a.data->'kind'))) end)).*
+  from public.assignments a
+  where p_cls is not null and length(p_cls) >= 6 and a.data->>'clsId' = p_cls order by a.created_at limit 300;
+$$;
+
+-- 003_marks.sql's rule, and not before the work is shown
+create or replace function public.hw_submit_ok(p_aid text, p_data jsonb, p_at timestamptz)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.assignments a where a.id = p_aid and (
+    a.owner = auth.uid()
+    or (a.open
+      and public.hw_shown(a.data, a.owner)
+      and p_at between now() - interval '5 minutes' and now() + interval '5 minutes'
+      and not (coalesce(p_data, '{}'::jsonb) ?| array['manual', 'manualWork', 'manualAns', 'ai'])
+      and coalesce(p_data->>'by', '') <> 'teacher'
+      and (a.due is null or now() <= a.due
+        or now() <= nullif(a.data->'ext'->>'all', '')::timestamptz
+        or (p_data->'stu' ? 'sid' and now() <= nullif(a.data->'ext'->'stu'->>left(encode(sha256(convert_to(coalesce(a.data->>'clsId', '') || '|id|' || lower(p_data->'stu'->>'sid'), 'UTF8')), 'hex'), 18), '')::timestamptz)))));
+$$;
+-- files of a hand-in: as before, and not before the work is shown
+create or replace function public.hw_accepts_any(aid text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.assignments a where a.id = aid and a.open and public.hw_shown(a.data, a.owner) and (
+    a.due is null or now() <= a.due
+    or now() <= nullif(a.data->'ext'->>'all', '')::timestamptz
+    or exists (select 1 from jsonb_each_text(coalesce(a.data->'ext'->'stu', '{}'::jsonb)) e where now() <= nullif(e.value, '')::timestamptz)));
+$$;
+
+revoke all on function public.hw_shown(jsonb, uuid) from public, anon, authenticated;
+revoke all on function public.hw_get(text), public.hw_class(text), public.hw_submit_ok(text, jsonb, timestamptz),
+  public.hw_accepts_any(text) from public, anon, authenticated;
+grant execute on function public.hw_get(text), public.hw_class(text), public.hw_submit_ok(text, jsonb, timestamptz),
+  public.hw_accepts_any(text) to anon, authenticated;
 
 commit;
