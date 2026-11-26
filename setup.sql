@@ -1,6 +1,6 @@
 -- BURIN : ตั้งค่าฐานข้อมูล Supabase
 -- วางทั้งไฟล์นี้ใน SQL Editor ของโปรเจกต์ แล้วกด Run รันซ้ำได้ไม่เสียหาย และไม่ลบข้อมูลที่มีอยู่
--- ไฟล์นี้ประกอบจาก 001_base.sql, 002_central.sql, 003_marks.sql, 004_show.sql ด้วย tools/sql_build.py ห้ามแก้ไฟล์นี้โดยตรง
+-- ไฟล์นี้ประกอบจาก 001_base.sql, 002_central.sql, 003_marks.sql, 004_show.sql, 005_plans.sql, 006_limits.sql, 007_listeners.sql, 008_consent.sql ด้วย tools/sql_build.py ห้ามแก้ไฟล์นี้โดยตรง
 -- ทุกส่วนรันในคราวเดียว ถ้าส่วนใดไม่สำเร็จ ฐานข้อมูลจะกลับเป็นเหมือนก่อนรัน
 
 begin;
@@ -678,5 +678,495 @@ revoke all on function public.hw_get(text), public.hw_class(text), public.hw_sub
   public.hw_accepts_any(text) from public, anon, authenticated;
 grant execute on function public.hw_get(text), public.hw_class(text), public.hw_submit_ok(text, jsonb, timestamptz),
   public.hw_accepts_any(text) to anon, authenticated;
+
+-- ======== 005_plans.sql ========
+
+-- 005_plans.sql: the plan of each account and when it ends (task 4.1)
+-- Builds on 002_central.sql (account_limits). Safe to run again; adds columns and functions, never drops or deletes.
+--
+-- Plans: 'free' (เริ่มต้น), 'presenter' (ผู้นำเสนอ), 'creator' (ผู้สร้างสื่อ). A higher plan has everything of a lower one.
+-- The plan is kept on account_limits next to the space of the account:
+--   plan        'presenter' or 'creator'; empty: the default in burin_settings ('plan_default'), else 'free'
+--   plan_until  when it ends; empty: no end (a lifetime purchase, or given by the owner of the project)
+--   plan_source where it came from: 'apple', 'google', 'trial', 'grant' (given by hand) ...
+--   plan_ref    the purchase it came from (the original transaction of the store), for task 4.4
+-- People can read their own row (002) but never write it: only the owner of the project (SQL Editor, Table Editor)
+-- and the server function that checks store receipts (task 4.4, service role) change it.
+-- A plan that has ended counts as 'free'; nothing is deleted and everything stays readable and exportable.
+--
+-- my_plan() tells the signed-in account its plan now. The app opens or closes what runs on the device by it (switch
+-- "plans"); what costs the server (space, devices, rooms, open work, listeners) is checked by the database in task 4.2.
+--
+-- Give someone a plan by hand, for example a year of presenter:
+--   insert into public.account_limits (owner, plan, plan_until, plan_source)
+--   select id, 'presenter', now() + interval '1 year', 'grant' from auth.users where email = 'someone@example.com'
+--   on conflict (owner) do update set plan = excluded.plan, plan_until = excluded.plan_until, plan_source = excluded.plan_source;
+
+alter table public.account_limits add column if not exists plan text;
+alter table public.account_limits add column if not exists plan_until timestamptz;
+alter table public.account_limits add column if not exists plan_source text;
+alter table public.account_limits add column if not exists plan_ref text;
+alter table public.account_limits drop constraint if exists account_limits_plan_check;
+alter table public.account_limits add constraint account_limits_plan_check check (plan is null or plan in ('free', 'presenter', 'creator'));
+comment on column public.account_limits.plan is 'free, presenter or creator; empty: the default in burin_settings (plan_default), else free';
+comment on column public.account_limits.plan_until is 'when the plan ends; empty: no end. After it ends the account is free';
+comment on column public.account_limits.plan_source is 'where the plan came from: apple, google, trial, grant';
+comment on column public.account_limits.plan_ref is 'the purchase the plan came from (original transaction id of the store)';
+
+insert into public.burin_settings (key, value, note) values
+  ('plan_default', null, 'the plan of an account that has none of its own: free, presenter or creator; empty means free')
+on conflict (key) do nothing;
+
+-- the plan an account has now (ended or unknown: free)
+create or replace function public.plan_of(p_owner uuid) returns text
+language sql stable security definer set search_path = public as $$
+  select case
+    when l.owner is not null and l.plan in ('presenter', 'creator') and (l.plan_until is null or l.plan_until > now()) then l.plan
+    when coalesce(l.plan, '') = '' and public.burin_setting('plan_default') in ('presenter', 'creator') then public.burin_setting('plan_default')
+    else 'free' end
+  from (select 1) one left join public.account_limits l on l.owner = p_owner;
+$$;
+
+-- the plan of the signed-in account: plan now, the plan bought (also when it has ended), when it ends, where it came
+-- from, and the time of the server (so a device with a wrong clock still knows whether it has ended)
+create or replace function public.my_plan()
+returns table (plan text, paid text, until timestamptz, source text, server_now timestamptz)
+language sql stable security definer set search_path = public as $$
+  select public.plan_of(m.me), coalesce(nullif(l.plan, ''), public.burin_setting('plan_default'), 'free'), l.plan_until, l.plan_source, now()
+  from (select auth.uid() as me) m left join public.account_limits l on l.owner = m.me where m.me is not null;
+$$;
+
+revoke all on function public.plan_of(uuid) from public, anon, authenticated;
+revoke all on function public.my_plan() from public, anon, authenticated;
+grant execute on function public.my_plan() to authenticated;
+
+-- ======== 006_limits.sql ========
+
+-- 006_limits.sql: what a plan allows of what costs the server, checked by the database (task 4.2, part 1)
+-- Builds on 002_central.sql and 005_plans.sql. Safe to run again; adds a table, settings, functions and rules,
+-- replaces rules under their old names, never drops a table or deletes a row of people's work.
+--
+-- Every limit here is a setting in burin_settings. Empty means no limit, and that is how this file leaves them,
+-- so running it changes nothing for anybody until the owner of the project fills them in (central cloud, task 4.2):
+--   quota_bytes        space of a free account (002). A paid plan gets quota_presenter or quota_creator, never less
+--   quota_presenter    space of a presenter account in bytes (5 GB); used only when quota_bytes has a limit
+--   quota_creator      space of a creator account in bytes (20 GB)
+--   devices_max        devices (sign-ins) one account uses at once, every plan (3)
+--   devices_idle_days  a device not used for this many days stops counting and is signed out (60; empty: never)
+--   rooms_free         classes (gradebook rooms, docs classes/...) a free account keeps (2); rooms_presenter, rooms_creator too
+--   open_free          assignments a free account has taking work at once (10); open_presenter, open_creator too
+-- A row of account_limits with quota_bytes still wins over all of them for that account (002).
+--
+-- Devices: a device is a sign-in, the session_id in the token Supabase gives it. Windows of one browser share it,
+-- so the audience screen in a second window or the installed app does not count. A room screen (#show) is not
+-- signed in. A device that only shows (a TV in present mode) says so (device_hello screen = true): it does not
+-- count, may read and follow the live room, but may not write. The first devices_max devices, by when they signed
+-- in, have a seat; a newer one waits until one is removed (device_remove signs that device out at once; its
+-- notebooks on the device are not touched). A waiting device cannot read or write anything of the account.
+-- Limits of a plan that ended (or was never bought) are those of free; nothing already there is deleted: a class
+-- or an open assignment above the limit stays and can still be changed, only adding one more is refused.
+
+insert into public.burin_settings (key, value, note) values
+  ('quota_presenter', '5368709120', 'space of a presenter account in bytes (5 GB); used only when quota_bytes has a limit, never less than it'),
+  ('quota_creator', '21474836480', 'space of a creator account in bytes (20 GB); used only when quota_bytes has a limit, never less than it'),
+  ('devices_max', null, 'devices (sign-ins) one account may use at once; empty: no limit (central cloud: 3)'),
+  ('devices_idle_days', '60', 'a device not used for this many days stops counting and is signed out when another device of the account opens the app; empty: never'),
+  ('rooms_free', null, 'classes a free account may keep; empty: no limit (central cloud: 2). rooms_presenter and rooms_creator work the same'),
+  ('open_free', null, 'assignments a free account may have taking work at once; empty: no limit (central cloud: 10). open_presenter and open_creator work the same')
+on conflict (key) do nothing;
+
+-- a limit of the plan the account has now: <what>_<plan> in burin_settings, empty: no limit
+create or replace function public.plan_limit(p_owner uuid, p_what text) returns bigint
+language sql stable security definer set search_path = public as $$
+  select case when public.burin_setting(p_what || '_' || public.plan_of(p_owner)) ~ '^[0-9]{1,15}$'
+              then public.burin_setting(p_what || '_' || public.plan_of(p_owner))::bigint end;
+$$;
+
+-- 1) space by plan (replaces 002's quota_of: a row of its own first, then the plan, then the default)
+create or replace function public.quota_of(p_owner uuid) returns bigint
+language sql stable security definer set search_path = public as $$
+  select case when l.owner is not null and l.quota_bytes is not null then (case when l.quota_bytes < 0 then null else l.quota_bytes end)
+              when public.burin_setting('quota_bytes') ~ '^[0-9]{1,18}$' then
+                greatest(public.burin_setting('quota_bytes')::bigint,
+                  case p.plan when 'presenter' then public.burin_num('quota_presenter', 0) when 'creator' then public.burin_num('quota_creator', 0) else 0 end)
+         end
+  from (select 1) one left join public.account_limits l on l.owner = p_owner cross join (select public.plan_of(p_owner) as plan) p;
+$$;
+
+-- 2) devices
+create table if not exists public.account_devices (
+  session uuid primary key,
+  owner uuid not null references auth.users (id) on delete cascade,
+  name text,
+  kind text,
+  screen boolean not null default false,
+  seen_at timestamptz not null default now()
+);
+comment on table public.account_devices is 'what each sign-in of an account calls itself (device_hello); the sign-ins themselves are auth.sessions';
+create index if not exists account_devices_owner on public.account_devices (owner);
+alter table public.account_devices enable row level security;
+
+create or replace function public.ts_or_null(p text) returns timestamptz
+language plpgsql immutable as $$
+begin return nullif(p, '')::timestamptz; exception when others then return null; end $$;
+
+-- the session of the request (empty: a token without one, or not signed in)
+create or replace function public.my_session() returns uuid
+language plpgsql stable as $$
+begin return nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'session_id', '')::uuid;
+exception when others then return null; end $$;
+
+-- every sign-in of an account that has not ended: when it began, when it was last used, whether it only shows,
+-- whether it is idle, and whether it has a seat. p_me is the session asking (it is in use, so never idle).
+-- Optional columns of auth.sessions are read through to_jsonb, so a project on an older Supabase still works.
+create or replace function public.device_seats(p_owner uuid, p_me uuid)
+returns table (session uuid, made timestamptz, active timestamptz, agent text, screen boolean, idle boolean, seat boolean)
+language sql stable security definer set search_path = public as $$
+  with s as (
+    select x.id, x.created_at as made,
+      greatest(x.created_at, x.updated_at, public.ts_or_null(to_jsonb(x) ->> 'refreshed_at'),
+        (select max(greatest(r.created_at, r.updated_at)) from auth.refresh_tokens r where r.session_id = x.id)) as active,
+      to_jsonb(x) ->> 'user_agent' as agent
+    from auth.sessions x
+    where x.user_id = p_owner and (public.ts_or_null(to_jsonb(x) ->> 'not_after') is null or public.ts_or_null(to_jsonb(x) ->> 'not_after') > now())
+  ), k as (
+    select s.*, coalesce(d.screen, false) as screen,
+      coalesce(s.id is distinct from p_me and public.burin_num('devices_idle_days', 0) > 0
+        and s.active < now() - make_interval(days => public.burin_num('devices_idle_days', 0)::int), false) as idle
+    from s left join public.account_devices d on d.session = s.id and d.owner = p_owner
+  )
+  select k.id, k.made, k.active, k.agent, k.screen, k.idle,
+    not k.screen and not k.idle and public.burin_num('devices_max', 0) > 0
+      and row_number() over (partition by (not k.screen and not k.idle) order by k.made, k.id) <= public.burin_num('devices_max', 0)
+  from k;
+$$;
+
+-- may this request touch the account's data (p_write: add or change). No limit set, not signed in, or a token
+-- without a session: yes, as before. Otherwise the session must have a seat; a screen may only read.
+create or replace function public.device_ok(p_write boolean) returns boolean
+language plpgsql stable security definer set search_path = public as $$
+declare me uuid := auth.uid(); sid uuid;
+begin
+  if public.burin_num('devices_max', 0) <= 0 or me is null then return true; end if;
+  sid := public.my_session();
+  if sid is null then return true; end if;
+  return exists (select 1 from public.device_seats(me, sid) d where d.session = sid and (d.seat or (d.screen and not p_write)));
+end $$;
+
+-- a device says what it is when the app opens (and again when that changes). Signs out devices of the account that
+-- have been idle too long, forgets names of sign-ins that ended, and answers where this device stands:
+-- state 'off' (no limit), 'ok' (has a seat), 'screen' (shows only), 'full' (waits), 'signin'; max, used (seats taken)
+create or replace function public.device_hello(p_name text, p_kind text, p_screen boolean) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare me uuid := auth.uid(); sid uuid := public.my_session(); mx bigint := public.burin_num('devices_max', 0); st text; used bigint;
+begin
+  if me is null then return jsonb_build_object('state', 'signin'); end if;
+  if sid is not null and exists (select 1 from auth.sessions x where x.id = sid and x.user_id = me) then
+    if mx > 0 then
+      begin
+        delete from auth.sessions x where x.user_id = me and x.id <> sid and x.id in (select d.session from public.device_seats(me, sid) d where d.idle);
+      exception when others then null; -- a project that does not let this file sign sessions out: idle ones just do not count
+      end;
+    end if;
+    delete from public.account_devices d where d.owner = me and d.session <> sid and not exists (select 1 from auth.sessions x where x.id = d.session);
+    insert into public.account_devices as d (session, owner, name, kind, screen, seen_at)
+    values (sid, me, left(coalesce(p_name, ''), 40), left(coalesce(p_kind, ''), 40), coalesce(p_screen, false), now())
+    on conflict (session) do update set name = excluded.name, kind = excluded.kind, screen = excluded.screen, seen_at = now()
+    where d.owner = me;
+  end if;
+  if mx <= 0 then return jsonb_build_object('state', 'off'); end if;
+  select count(*) filter (where d.seat) into used from public.device_seats(me, sid) d;
+  select case when sid is null then 'ok' when d.seat then 'ok' when d.screen then 'screen' else 'full' end into st
+  from (select 1) one left join public.device_seats(me, sid) d on d.session = sid;
+  return jsonb_build_object('state', st, 'max', mx, 'used', used);
+end $$;
+
+-- the devices of the signed-in account, this one first, then by seat and last use
+create or replace function public.my_devices()
+returns table (session uuid, name text, kind text, agent text, made timestamptz, active timestamptz, screen boolean, idle boolean, seat boolean, me boolean)
+language sql stable security definer set search_path = public as $$
+  select d.session, a.name, a.kind, d.agent, d.made, d.active, d.screen, d.idle, d.seat, d.session = public.my_session()
+  from public.device_seats(auth.uid(), public.my_session()) d left join public.account_devices a on a.session = d.session
+  where auth.uid() is not null
+  order by (d.session = public.my_session()) desc nulls last, d.seat desc, d.active desc;
+$$;
+
+-- sign one device of this account out at once ('ok'; 'none': no such device; 'signin'). Also from a device that waits.
+create or replace function public.device_remove(p_session uuid) returns text
+language plpgsql security definer set search_path = public as $$
+declare me uuid := auth.uid(); n int;
+begin
+  if me is null then return 'signin'; end if;
+  delete from auth.sessions x where x.id = p_session and x.user_id = me;
+  get diagnostics n = row_count;
+  delete from public.account_devices d where d.session = p_session and d.owner = me;
+  return case when n > 0 then 'ok' else 'none' end;
+end $$;
+
+-- the rules of 001 and 002 again, each with the device check (same names, so running again replaces them)
+drop policy if exists "docs: own rows" on public.docs;
+create policy "docs: own rows" on public.docs for all to authenticated
+  using (owner = auth.uid() and (select public.device_ok(false)))
+  with check (owner = auth.uid() and (select public.device_ok(true)));
+drop policy if exists "shares: owner writes" on public.shares;
+create policy "shares: owner writes" on public.shares for all to authenticated
+  using (owner = auth.uid() and (select public.device_ok(false)))
+  with check (owner = auth.uid() and (select public.device_ok(true)));
+drop policy if exists "assignments: owner writes" on public.assignments;
+create policy "assignments: owner writes" on public.assignments for all to authenticated
+  using (owner = auth.uid() and (select public.device_ok(false)))
+  with check (owner = auth.uid() and (select public.device_ok(true)));
+drop policy if exists "submissions: teacher reads" on public.submissions;
+drop policy if exists "submissions: teacher marks" on public.submissions;
+drop policy if exists "submissions: teacher deletes" on public.submissions;
+create policy "submissions: teacher reads" on public.submissions for select to authenticated
+  using (exists (select 1 from public.assignments a where a.id = assignment and a.owner = auth.uid()) and (select public.device_ok(false)));
+create policy "submissions: teacher marks" on public.submissions for update to authenticated
+  using (exists (select 1 from public.assignments a where a.id = assignment and a.owner = auth.uid()) and (select public.device_ok(true)));
+create policy "submissions: teacher deletes" on public.submissions for delete to authenticated
+  using (exists (select 1 from public.assignments a where a.id = assignment and a.owner = auth.uid()) and (select public.device_ok(false)));
+
+drop policy if exists "burin files: read own" on storage.objects;
+drop policy if exists "burin files: add own" on storage.objects;
+drop policy if exists "burin files: change own" on storage.objects;
+drop policy if exists "burin files: delete own" on storage.objects;
+create policy "burin files: read own" on storage.objects for select to authenticated
+  using (bucket_id = 'burin' and (storage.foldername(name))[1] = auth.uid()::text and (select public.device_ok(false)));
+create policy "burin files: add own" on storage.objects for insert to authenticated
+  with check (bucket_id = 'burin' and (storage.foldername(name))[1] = auth.uid()::text and public.quota_ok_mine() and (select public.device_ok(true)));
+create policy "burin files: change own" on storage.objects for update to authenticated
+  using (bucket_id = 'burin' and (storage.foldername(name))[1] = auth.uid()::text and (select public.device_ok(true)))
+  with check (bucket_id = 'burin' and (storage.foldername(name))[1] = auth.uid()::text and public.quota_ok_mine() and (select public.device_ok(true)));
+create policy "burin files: delete own" on storage.objects for delete to authenticated
+  using (bucket_id = 'burin' and (storage.foldername(name))[1] = auth.uid()::text and (select public.device_ok(false)));
+drop policy if exists "homework files: teacher reads" on storage.objects;
+drop policy if exists "homework files: teacher deletes" on storage.objects;
+create policy "homework files: teacher reads" on storage.objects for select to authenticated
+  using (bucket_id = 'burin-sub' and exists (select 1 from public.assignments a where a.id = (storage.foldername(name))[1] and a.owner = auth.uid()) and (select public.device_ok(false)));
+create policy "homework files: teacher deletes" on storage.objects for delete to authenticated
+  using (bucket_id = 'burin-sub' and exists (select 1 from public.assignments a where a.id = (storage.foldername(name))[1] and a.owner = auth.uid()) and (select public.device_ok(false)));
+
+do $$ begin
+  if to_regclass('realtime.messages') is not null then
+    drop policy if exists "burin: own account channels, receive" on realtime.messages;
+    drop policy if exists "burin: own account channels, send" on realtime.messages;
+    create policy "burin: own account channels, receive" on realtime.messages for select to authenticated
+      using (realtime.topic() in ('room-' || auth.uid()::text, 'docs-' || auth.uid()::text) and (select public.device_ok(false)));
+    create policy "burin: own account channels, send" on realtime.messages for insert to authenticated
+      with check (realtime.topic() in ('room-' || auth.uid()::text, 'docs-' || auth.uid()::text) and (select public.device_ok(false)));
+  end if;
+end $$;
+
+-- a waiting device cannot claim a room for live teaching ('device'); otherwise as in 002
+create or replace function public.room_claim(p_code text, p_pub jsonb) returns text
+language plpgsql security definer set search_path = public as $$
+declare me uuid := auth.uid(); who uuid;
+begin
+  if me is null then return 'signin'; end if;
+  if not public.device_ok(true) then return 'device'; end if;
+  if p_code is null or p_code !~ '^[A-Z2-9]{6}$' then return 'bad'; end if;
+  if p_pub is null or jsonb_typeof(p_pub) <> 'object' or coalesce(p_pub->>'x', '') !~ '^[A-Za-z0-9_-]{20,100}$'
+     or coalesce(p_pub->>'y', '') !~ '^[A-Za-z0-9_-]{20,100}$' then return 'bad'; end if;
+  insert into public.shares as s (id, owner, title, data)
+  values ('room-' || p_code, me, 'room ' || p_code, jsonb_build_object('kty', 'EC', 'crv', 'P-256', 'x', p_pub->>'x', 'y', p_pub->>'y'))
+  on conflict (id) do update set data = excluded.data where s.owner = me
+  returning s.owner into who;
+  if who is null then return 'taken'; end if;
+  return 'ok';
+end $$;
+
+-- 3) classes (rooms of the gradebook): a new one beyond the plan is refused; changing one that is there is not
+create or replace function public.rooms_gate() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare lim bigint;
+begin
+  if new.path !~ '^classes/[^/]+$' then return new; end if;
+  if exists (select 1 from public.docs d where d.owner = new.owner and d.path = new.path) then return new; end if;
+  lim := public.plan_limit(new.owner, 'rooms');
+  if lim is not null and (select count(*) from public.docs d where d.owner = new.owner and d.path ~ '^classes/[^/]+$') >= lim then
+    raise exception 'BURIN_PLAN: this plan keeps % classes', lim using errcode = 'P0001', hint = 'rooms';
+  end if;
+  return new;
+end $$;
+drop trigger if exists burin_rooms on public.docs;
+create trigger burin_rooms before insert on public.docs for each row execute function public.rooms_gate();
+
+-- 4) assignments taking work: open, and its due time (or a time given to the class or to one learner) not passed
+create or replace function public.hw_taking(p_open boolean, p_due timestamptz, p_data jsonb) returns boolean
+language plpgsql stable as $$
+begin
+  return coalesce(p_open, false) and coalesce(p_due is null or now() <= p_due
+    or now() <= public.ts_or_null(p_data->'ext'->>'all')
+    or exists (select 1 from jsonb_each_text(case when jsonb_typeof(p_data->'ext'->'stu') = 'object' then p_data->'ext'->'stu' else '{}'::jsonb end) e
+               where now() <= public.ts_or_null(e.value)), false);
+end $$;
+-- a new assignment that takes work, or one that starts taking work again (opened, due time moved later), is refused
+-- when the plan's number is reached; changing one that already takes work is not
+create or replace function public.open_gate() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare lim bigint;
+begin
+  if not public.hw_taking(new.open, new.due, new.data) then return new; end if;
+  if tg_op = 'UPDATE' and public.hw_taking(old.open, old.due, old.data) then return new; end if;
+  lim := public.plan_limit(new.owner, 'open');
+  if lim is not null and (select count(*) from public.assignments a where a.owner = new.owner and a.id <> new.id and public.hw_taking(a.open, a.due, a.data)) >= lim then
+    raise exception 'BURIN_PLAN: this plan takes work in % assignments at once', lim using errcode = 'P0001', hint = 'work';
+  end if;
+  return new;
+end $$;
+drop trigger if exists burin_open on public.assignments;
+create trigger burin_open before insert or update on public.assignments for each row execute function public.open_gate();
+
+-- what the signed-in account may still add: classes and assignments taking work now and their limits (empty: none)
+create or replace function public.my_limits()
+returns table (rooms bigint, rooms_max bigint, open_work bigint, open_max bigint, devices_max bigint)
+language sql stable security definer set search_path = public as $$
+  select (select count(*) from public.docs d where d.owner = m.me and d.path ~ '^classes/[^/]+$'), public.plan_limit(m.me, 'rooms'),
+    (select count(*) from public.assignments a where a.owner = m.me and public.hw_taking(a.open, a.due, a.data)), public.plan_limit(m.me, 'open'),
+    nullif(public.burin_num('devices_max', 0), 0)
+  from (select auth.uid() as me) m where m.me is not null;
+$$;
+
+revoke all on table public.account_devices from anon, authenticated;
+revoke all on function public.plan_limit(uuid, text), public.ts_or_null(text), public.my_session(), public.device_seats(uuid, uuid),
+  public.rooms_gate(), public.hw_taking(boolean, timestamptz, jsonb), public.open_gate(),
+  public.quota_of(uuid) from public, anon, authenticated;
+-- device_ok is part of the rules above, so whoever is signed in runs it (it only answers for its own request)
+revoke all on function public.device_ok(boolean), public.device_hello(text, text, boolean), public.my_devices(), public.device_remove(uuid),
+  public.my_limits(), public.room_claim(text, jsonb) from public, anon, authenticated;
+grant execute on function public.device_ok(boolean), public.device_hello(text, text, boolean), public.my_devices(), public.device_remove(uuid),
+  public.my_limits(), public.room_claim(text, jsonb) to authenticated;
+
+-- ======== 007_listeners.sql ========
+
+-- 007_listeners.sql: listeners in a live room by the plan of its teacher (task 4.2, part 2)
+-- Builds on 002_central.sql (room_claim), 005_plans.sql and 006_limits.sql (plan_limit). Safe to run again;
+-- adds a table, a setting and functions, never drops a table or deletes a row of people's work.
+--
+-- A live room is the public channel class-<code>; learners join it without an account, so the channel itself cannot
+-- count them. Before joining, the app asks room_seat(code, seat) with the random id of the device (the same on every
+-- visit, so coming back does not take a second seat). The room belongs to the account that claimed the code
+-- (room_claim, the shares row room-<code>); its plan sets listeners_<plan> in burin_settings (empty: no limit, and
+-- that is how this file leaves them; central cloud: listeners_free 40). A seat lasts 3 minutes and the app renews it
+-- every minute while in the room; leaving gives it back (room_leave). A room screen (#show) does not ask.
+-- Limit of this way: someone who changes the app on their own device can still join the public channel without a
+-- seat. A room without an owner (a version 1 room, or a code nobody claimed) has no limit.
+
+insert into public.burin_settings (key, value, note) values
+  ('listeners_free', null, 'learners at once in a live room of a free account; empty: no limit (central cloud: 40). listeners_presenter and listeners_creator work the same')
+on conflict (key) do nothing;
+
+create table if not exists public.room_seats (
+  code text not null,
+  seat text not null,
+  at timestamptz not null default now(),
+  primary key (code, seat)
+);
+comment on table public.room_seats is 'learners in a live room now (room_seat); a seat not renewed for 3 minutes is free again';
+create index if not exists room_seats_at on public.room_seats (at);
+alter table public.room_seats enable row level security;
+
+-- a seat in room <code> for the device <seat>: state 'ok' (in; max and used when the room has a limit), 'full'
+-- (max), or 'bad' (not a room code or seat id). A device that has a seat keeps it and renews it.
+create or replace function public.room_seat(p_code text, p_seat text) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare who uuid; lim bigint; used bigint;
+begin
+  if p_code is null or p_code !~ '^[A-Z2-9]{6}$' or p_seat is null or p_seat !~ '^[A-Za-z0-9_-]{4,64}$' then
+    return jsonb_build_object('state', 'bad');
+  end if;
+  select s.owner into who from public.shares s where s.id = 'room-' || p_code;
+  lim := case when who is null then null else public.plan_limit(who, 'listeners') end;
+  if lim is null then return jsonb_build_object('state', 'ok'); end if;
+  perform pg_advisory_xact_lock(hashtext('burin-room-' || p_code));
+  delete from public.room_seats r where r.code = p_code and r.at < now() - interval '3 minutes';
+  if random() < 0.02 then delete from public.room_seats r where r.at < now() - interval '1 day'; end if;
+  update public.room_seats r set at = now() where r.code = p_code and r.seat = p_seat;
+  if not found then
+    select count(*) into used from public.room_seats r where r.code = p_code;
+    if used >= lim then return jsonb_build_object('state', 'full', 'max', lim); end if;
+    insert into public.room_seats (code, seat) values (p_code, p_seat) on conflict (code, seat) do update set at = now();
+  end if;
+  select count(*) into used from public.room_seats r where r.code = p_code;
+  return jsonb_build_object('state', 'ok', 'max', lim, 'used', used);
+end $$;
+
+-- the device leaves the room: its seat is free at once
+create or replace function public.room_leave(p_code text, p_seat text) returns void
+language sql security definer set search_path = public as $$
+  delete from public.room_seats r where r.code = p_code and r.seat = p_seat;
+$$;
+
+revoke all on table public.room_seats from anon, authenticated;
+revoke all on function public.room_seat(text, text), public.room_leave(text, text) from public, anon, authenticated;
+grant execute on function public.room_seat(text, text), public.room_leave(text, text) to anon, authenticated;
+
+-- ======== 008_consent.sql ========
+
+-- 008_consent.sql: a record of each agreement to the terms and the privacy policy that the account cannot change
+-- (task 1.10). Builds on 002_central.sql. Safe to run again; adds a table, a function and a trigger on auth.users,
+-- never drops a table or deletes a row of people's work.
+--
+-- The app sends the agreement with the sign-up and later with updateUser, as user_metadata.consent
+-- { v, at, age, guardian, by }. user_metadata can be rewritten by the account itself, so it alone is no proof of what
+-- was agreed and when. Every time that consent changes (a new account, or a new version agreed), the trigger below
+-- copies it here with the time of the server. The account reads its own rows (my_consents); nobody can change or
+-- remove a row through the API. Deleting the account removes its rows with it (the policy promises deletion).
+
+create table if not exists public.consents (
+  id bigserial primary key,
+  owner uuid not null references auth.users (id) on delete cascade,
+  at timestamptz not null default now(),
+  v text not null default '' check (char_length(v) <= 20),
+  age text not null default '' check (char_length(age) <= 10),
+  guardian text not null default '' check (char_length(guardian) <= 80),
+  by text not null default '' check (char_length(by) <= 10),
+  told_at text not null default '' check (char_length(told_at) <= 40)
+);
+comment on table public.consents is 'each agreement to the terms and privacy policy, copied from user_metadata.consent with the server time (008_consent.sql); read with my_consents()';
+create index if not exists consents_owner on public.consents (owner, at);
+alter table public.consents enable row level security;
+revoke all on public.consents from anon, authenticated;
+revoke all on sequence public.consents_id_seq from anon, authenticated;
+-- no policy: rows are written by the trigger and read by my_consents() only
+
+create or replace function public.consent_keep() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare c jsonb; o jsonb;
+begin
+  c := coalesce(new.raw_user_meta_data, '{}'::jsonb) -> 'consent';
+  if c is null or jsonb_typeof(c) <> 'object' then return new; end if;
+  if tg_op = 'UPDATE' then
+    o := coalesce(old.raw_user_meta_data, '{}'::jsonb) -> 'consent';
+    if o is not distinct from c then return new; end if;
+  end if;
+  insert into public.consents (owner, v, age, guardian, by, told_at)
+  values (new.id, left(coalesce(c ->> 'v', ''), 20), left(coalesce(c ->> 'age', ''), 10),
+          left(coalesce(c ->> 'guardian', ''), 80), left(coalesce(c ->> 'by', ''), 10), left(coalesce(c ->> 'at', ''), 40));
+  return new;
+end $$;
+revoke all on function public.consent_keep() from public, anon, authenticated;
+
+drop trigger if exists consent_keep on auth.users;
+create trigger consent_keep after insert or update of raw_user_meta_data on auth.users
+  for each row execute function public.consent_keep();
+
+-- the agreements of the signed-in account, newest first
+create or replace function public.my_consents()
+returns table (at timestamptz, v text, age text, guardian text, by text)
+language sql stable security definer set search_path = public as $$
+  select c.at, c.v, c.age, c.guardian, c.by from public.consents c where c.owner = auth.uid() order by c.at desc, c.id desc
+$$;
+revoke all on function public.my_consents() from public, anon;
+grant execute on function public.my_consents() to authenticated;
+
+-- an account made before this file: the agreement it already sent is copied once, with the time it was run
+insert into public.consents (owner, v, age, guardian, by, told_at)
+select u.id, left(coalesce(u.raw_user_meta_data -> 'consent' ->> 'v', ''), 20), left(coalesce(u.raw_user_meta_data -> 'consent' ->> 'age', ''), 10),
+       left(coalesce(u.raw_user_meta_data -> 'consent' ->> 'guardian', ''), 80), left(coalesce(u.raw_user_meta_data -> 'consent' ->> 'by', ''), 10),
+       left(coalesce(u.raw_user_meta_data -> 'consent' ->> 'at', ''), 40)
+from auth.users u
+where jsonb_typeof(u.raw_user_meta_data -> 'consent') = 'object'
+  and not exists (select 1 from public.consents c where c.owner = u.id);
 
 commit;

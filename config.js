@@ -8,5 +8,8 @@
 window.BURIN_CONFIG = {
   supabaseUrl: 'https://zimxhnrxboclnjexftzv.supabase.co',
   supabaseKey: 'sb_publishable_p9nIZS6esGhD6EtG2FAP6Q_e5ExX00d',
-  turnstileKey: '0x4AAAAAAGQWvTntwTeDwMxR'
+  turnstileKey: '0x4AAAAAAGQWvTntwTeDwMxR',
+  consent: true,
+  privacyOwner: 'Sarayut Pantian',
+  privacyContact: 's1pantian@gmail.com'
 };
